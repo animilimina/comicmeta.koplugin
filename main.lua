@@ -3,10 +3,16 @@ Plugin for KOReader to extract metadata from comic (.cbz and .cbr) files as Cust
 
 @module koplugin.ComicMeta
 --]]
---
-package.path = package.path .. ";plugins/comicmeta.koplugin/lib/comiclib/?.lua"
-package.path = package.path .. ";plugins/comicmeta.koplugin/lib/comiclib/lib/?.lua"
-package.path = package.path .. ";plugins/comicmeta.koplugin/lib/comiclib/third_party/?/?.lua"
+
+local function getPluginPath()
+    local path = debug.getinfo(1, "S").source:sub(2)  -- Enlève le '@' au début
+    return path:match("(.*/)")  -- Récupère juste le dossier
+end
+
+local plugin_path = getPluginPath()
+package.path = package.path .. ";" .. plugin_path .. "lib/comiclib/?.lua"
+package.path = package.path .. ";" .. plugin_path .. "lib/comiclib/lib/?.lua"
+package.path = package.path .. ";" .. plugin_path .. "lib/comiclib/third_party/?/?.lua"
 
 local ComicLib = require("comiclib")
 local Dispatcher = require("dispatcher") -- luacheck:ignore
@@ -14,6 +20,8 @@ local DocSettings = require("docsettings")
 local Event = require("ui/event")
 local FileManager = require("apps/filemanager/filemanager")
 local InfoMessage = require("ui/widget/infomessage")
+local Menu = require("ui/widget/menu")
+local Screen = require("device").screen
 local Trapper = require("ui/trapper")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
@@ -23,6 +31,8 @@ local logger = require("logger")
 local util = require("util")
 local T = ffiUtil.template
 local _ = require("gettext")
+
+-- ... reste du code inchangé
 
 local ComicMeta = WidgetContainer:extend({
     name = "comicmeta",
@@ -214,8 +224,8 @@ end
 ---
 -- @param folder string: The folder to process.
 -- @param recursive boolean: Whether to process subfolders recursively.
-function ComicMeta:processAllComics(folder, recursive)
-    logger.dbg("ComicMeta -> processAllComics processing folder", folder, "recursive:", recursive)
+function ComicMeta:processDirectory(folder, recursive)
+    logger.dbg("ComicMeta -> processDirectory processing folder", folder, "recursive:", recursive)
 
     Trapper:setPausedText(_("Do you want to abort extraction?"), _("Abort"), _("Don't abort"))
 
@@ -229,20 +239,23 @@ function ComicMeta:processAllComics(folder, recursive)
     local comic_files = self:scanForComicFiles(folder, recursive)
 
     if #comic_files == 0 then
-        logger.dbg("ComicMeta -> processAllComics no comic files found")
+        logger.dbg("ComicMeta -> processDirectory no comic files found")
         Trapper:info(_("No comics found."))
         return
     end
 
-    logger.dbg("ComicMeta -> processAllComics found", #comic_files, "comic files to process")
+    logger.dbg("ComicMeta -> processDirectory found", #comic_files, "comic files to process")
+    self:processFiles(comic_files)  -- Nom en minuscule pour suivre la convention Lua
+end
 
+function ComicMeta:processFiles(comic_files)
     local successes = 0
 
     for idx, file_path in ipairs(comic_files) do
         local real_path = ffiUtil.realpath(file_path)
 
-        logger.dbg("ComicMeta -> processAllComics processing file", real_path)
-        doNotAbort = Trapper:info(
+        logger.dbg("ComicMeta -> processFiles processing file", real_path)
+        local doNotAbort = Trapper:info(  -- Ajout de 'local' ici
             T(
                 _([[
 Extracting metadata...
@@ -339,7 +352,6 @@ function ComicMeta:writeCustomToC(doc_settings, pages_data)
     doc_settings:saveSetting("handmade_toc", toc)
     doc_settings:saveSetting("handmade_toc_enabled", true)
     doc_settings:saveSetting("handmade_toc_edit_enabled", false)
-    return true
 end
 
 --- This is basically the plugin's main()
@@ -368,6 +380,7 @@ It's recommended to keep your device plugged in, as this can use some battery po
             return
         end
 
+        -- First ask about subdirectories if they exist
         if has_subdirs then
             recursive = Trapper:confirm(
                 _([[
@@ -380,10 +393,130 @@ Also extract comic metadata from comics in subdirectories?]]),
             )
         end
 
+        -- Then ask about full directory or selection
+        local full_directory = Trapper:confirm(
+            _([[
+Do you want to process the full directory or only a selection of files?]]),
+            _("Select files"),
+            _("Full directory")
+        )
+
         Trapper:clear()
 
-        self:processAllComics(current_folder, recursive)
+        if full_directory then
+            -- Process entire directory
+            self:processDirectory(current_folder, recursive)
+        else
+            -- Show file selector with files from current and subdirectories if recursive
+            self:showFileSelector(current_folder, recursive)
+        end
     end)
+end
+
+function ComicMeta:showFileSelector(folder, recursive)
+    local file_items = {}
+
+    -- Scan for comic files (with or without recursion)
+    local comic_files = self:scanForComicFiles(folder, recursive)
+
+    if #comic_files == 0 then
+        UIManager:show(InfoMessage:new({
+            text = _("No comic files (.cbr/.cbz) found"),
+        }))
+        return
+    end
+
+    -- Sort files: main folder first, then subdirectories, alphabetically within each group
+    table.sort(comic_files, function(a, b)
+        -- Check if files are in the main folder or subdirectories
+        local a_in_main = not a:match("^" .. folder .. "/[^/]+/")
+        local b_in_main = not b:match("^" .. folder .. "/[^/]+/")
+
+        -- If one is in main folder and the other is not, main folder comes first
+        if a_in_main and not b_in_main then
+            return true
+        elseif not a_in_main and b_in_main then
+            return false
+        end
+
+        -- Both in same category (main or subdirs), sort alphabetically by filename
+        local filename_a = a:match("([^/]+)$"):lower()
+        local filename_b = b:match("([^/]+)$"):lower()
+        return filename_a < filename_b
+    end)
+
+    -- Convert to menu items
+    for _, file_path in ipairs(comic_files) do
+        local filename = file_path:match("([^/]+)$")
+        -- Show relative path if recursive to help identify files in subdirectories
+        local display_text = filename
+        if recursive then
+            -- Show path relative to base folder
+            local relative_path = file_path:gsub("^" .. folder .. "/", "")
+            display_text = relative_path
+        end
+
+        table.insert(file_items, {
+            text = display_text,
+            path = file_path,
+            selected = false,
+        })
+    end
+
+    local file_menu
+    file_menu = Menu:new{
+        title = _("Select files"),
+        item_table = file_items,
+        is_borderless = true,
+        is_popout = false,
+        width = Screen:getWidth(),
+        height = Screen:getHeight(),
+        single_line = true,
+        -- Add a button in the title bar
+        title_bar_left_icon = "check",
+        onLeftButtonTap = function()
+            UIManager:close(file_menu)
+
+            -- Extract only the paths of selected files
+            local selected_files = {}
+            for _, file_item in ipairs(file_items) do
+                if file_item.selected then
+                    table.insert(selected_files, file_item.path)
+                end
+            end
+
+            -- Check that at least one file is selected
+            if #selected_files == 0 then
+                UIManager:show(InfoMessage:new({
+                    text = _("No file selected"),
+                }))
+                return
+            end
+
+            -- Call processFiles with the list of paths
+            self:processFiles(selected_files)
+        end,
+        onMenuSelect = function(menu, item)
+            -- Toggle selection
+            item.selected = not item.selected
+            -- Update the text to show selection status
+            local base_text = item.path
+            if recursive then
+                base_text = item.path:gsub("^" .. folder .. "/", "")
+            else
+                base_text = item.path:match("([^/]+)$")
+            end
+
+            if item.selected then
+                item.text = "✓ " .. base_text
+            else
+                item.text = base_text
+            end
+            menu:updateItems()
+        end,
+    }
+
+    UIManager:show(file_menu)
 end
 
 return ComicMeta
