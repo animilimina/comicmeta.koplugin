@@ -4,18 +4,22 @@ Plugin for KOReader to extract metadata from comic (.cbz and .cbr) files as Cust
 @module koplugin.ComicMeta
 --]]
 
-local function getPluginPath()
-    local path = debug.getinfo(1, "S").source:sub(2)  -- Enlève le '@' au début
-    return path:match("(.*/)")  -- Récupère juste le dossier
+-- Get the absolute path of this plugin directory
+local function getPluginDir()
+    local source = debug.getinfo(1, "S").source
+    -- Remove @ and file: prefix if present
+    source = source:gsub("^@", ""):gsub("^file:", "")
+    -- Extract directory
+    return source:match("^(.*[/\\])")
 end
 
-local plugin_path = getPluginPath()
-package.path = package.path .. ";" .. plugin_path .. "lib/comiclib/?.lua"
-package.path = package.path .. ";" .. plugin_path .. "lib/comiclib/lib/?.lua"
-package.path = package.path .. ";" .. plugin_path .. "lib/comiclib/third_party/?/?.lua"
+local plugin_dir = getPluginDir()
+package.path = package.path .. ";" .. plugin_dir .. "lib/comiclib/?.lua"
+package.path = package.path .. ";" .. plugin_dir .. "lib/comiclib/lib/?.lua"
+package.path = package.path .. ";" .. plugin_dir .. "lib/comiclib/third_party/?/?.lua"
 
 local ComicLib = require("comiclib")
-local Dispatcher = require("dispatcher") -- luacheck:ignore
+local Dispatcher = require("dispatcher")
 local DocSettings = require("docsettings")
 local Event = require("ui/event")
 local FileManager = require("apps/filemanager/filemanager")
@@ -237,7 +241,11 @@ function ComicMeta:processDirectory(folder, recursive)
     ffiUtil.sleep(2) -- Pause so that the user can see it
 
     local comic_files = self:scanForComicFiles(folder, recursive)
+    self:processFiles(comic_files)
 
+end
+
+function ComicMeta:processFiles(comic_files)
     if #comic_files == 0 then
         logger.dbg("ComicMeta -> processDirectory no comic files found")
         Trapper:info(_("No comics found."))
@@ -245,10 +253,6 @@ function ComicMeta:processDirectory(folder, recursive)
     end
 
     logger.dbg("ComicMeta -> processDirectory found", #comic_files, "comic files to process")
-    self:processFiles(comic_files)  -- Nom en minuscule pour suivre la convention Lua
-end
-
-function ComicMeta:processFiles(comic_files)
     local successes = 0
 
     for idx, file_path in ipairs(comic_files) do
@@ -426,42 +430,144 @@ function ComicMeta:showFileSelector(folder, recursive)
         return
     end
 
-    -- Sort files: main folder first, then subdirectories, alphabetically within each group
-    table.sort(comic_files, function(a, b)
-        -- Check if files are in the main folder or subdirectories
-        local a_in_main = not a:match("^" .. folder .. "/[^/]+/")
-        local b_in_main = not b:match("^" .. folder .. "/[^/]+/")
-
-        -- If one is in main folder and the other is not, main folder comes first
-        if a_in_main and not b_in_main then
-            return true
-        elseif not a_in_main and b_in_main then
-            return false
-        end
-
-        -- Both in same category (main or subdirs), sort alphabetically by filename
-        local filename_a = a:match("([^/]+)$"):lower()
-        local filename_b = b:match("([^/]+)$"):lower()
-        return filename_a < filename_b
-    end)
-
-    -- Convert to menu items
+    -- Store file metadata for sorting (with safe fallbacks)
+    local file_metadata = {}
     for _, file_path in ipairs(comic_files) do
-        local filename = file_path:match("([^/]+)$")
-        -- Show relative path if recursive to help identify files in subdirectories
-        local display_text = filename
-        if recursive then
-            -- Show path relative to base folder
-            local relative_path = file_path:gsub("^" .. folder .. "/", "")
-            display_text = relative_path
-        end
-
-        table.insert(file_items, {
-            text = display_text,
-            path = file_path,
-            selected = false,
-        })
+        local attr = lfs.attributes(file_path)
+        file_metadata[file_path] = {
+            modification = (attr and attr.modification) or 0,
+            size = (attr and attr.size) or 0,
+        }
     end
+
+    -- Sorting function with error handling
+    -- Sorting function with error handling and stable sort
+    local function sortFiles(sort_type, sort_order)
+        table.sort(comic_files, function(a, b)
+            -- Wrap everything in pcall for safety
+            local success, result = pcall(function()
+                -- Check if files are in the main folder or subdirectories
+                local a_in_main = not a:match("^" .. folder .. "/[^/]+/")
+                local b_in_main = not b:match("^" .. folder .. "/[^/]+/")
+
+                -- Main folder vs subdirectories hierarchy
+                if a_in_main and not b_in_main then
+                    return true
+                elseif not a_in_main and b_in_main then
+                    return false
+                end
+
+                -- Get metadata safely
+                local meta_a = file_metadata[a] or { modification = 0, size = 0 }
+                local meta_b = file_metadata[b] or { modification = 0, size = 0 }
+
+                -- Get filenames for stable sort
+                local filename_a = a:match("([^/]+)$") or ""
+                local filename_b = b:match("([^/]+)$") or ""
+
+                -- Both in same category, sort by selected criterion
+                local compare_result
+                local are_equal = false
+
+                if sort_type == "name" then
+                    compare_result = filename_a:lower() < filename_b:lower()
+                elseif sort_type == "date" then
+                    -- Ensure we have valid numbers
+                    local date_a = tonumber(meta_a.modification) or 0
+                    local date_b = tonumber(meta_b.modification) or 0
+
+                    if date_a == date_b then
+                        -- If dates are equal, use filename as tiebreaker
+                        are_equal = true
+                        compare_result = filename_a:lower() < filename_b:lower()
+                    else
+                        compare_result = date_a < date_b
+                    end
+                elseif sort_type == "size" then
+                    -- Ensure we have valid numbers
+                    local size_a = tonumber(meta_a.size) or 0
+                    local size_b = tonumber(meta_b.size) or 0
+
+                    if size_a == size_b then
+                        -- If sizes are equal, use filename as tiebreaker
+                        are_equal = true
+                        compare_result = filename_a:lower() < filename_b:lower()
+                    else
+                        compare_result = size_a < size_b
+                    end
+                end
+
+                -- Apply sort order (but not to tiebreaker when values are equal)
+                if sort_order == "desc" and not are_equal then
+                    return not compare_result
+                else
+                    return compare_result
+                end
+            end)
+
+            -- If pcall failed, maintain current order
+            if not success then
+                logger.warn("ComicMeta: Sort comparison failed:", result)
+                return false
+            end
+
+            return result
+        end)
+    end
+
+    -- Function to get sort label
+    local function getSortLabel(sort_type, sort_order)
+        local labels = {
+            name_asc = "Name ↑",
+            name_desc = "Name ↓",
+            date_asc = "Date ↑",
+            date_desc = "Date ↓",
+            size_asc = "Size ↑",
+            size_desc = "Size ↓",
+        }
+        return labels[sort_type .. "_" .. sort_order] or "Name ↑"
+    end
+
+    -- Initial sort (name ascending)
+    local current_sort_type = "name"
+    local current_sort_order = "asc"
+
+    -- Function to rebuild menu items after sorting
+    local function rebuildMenuItems()
+        file_items = {}
+
+        -- Add sort button as first item
+        table.insert(file_items, {
+            text = "⚙ Sort: " .. getSortLabel(current_sort_type, current_sort_order),
+            is_sort_button = true,
+        })
+
+        -- Add separator
+        table.insert(file_items, {
+            text = "────────────────────────",
+            is_separator = true,
+        })
+
+        -- Add files
+        for index, file_path in ipairs(comic_files) do
+            local filename = file_path:match("([^/]+)$")
+            local display_text = filename
+            if recursive then
+                local relative_path = file_path:gsub("^" .. folder .. "/", "")
+                display_text = relative_path
+            end
+
+            table.insert(file_items, {
+                text = display_text,
+                path = file_path,
+                selected = false,
+                index = index,
+            })
+        end
+    end
+
+    sortFiles(current_sort_type, current_sort_order)
+    rebuildMenuItems()
 
     local file_menu
     file_menu = Menu:new{
@@ -472,16 +578,17 @@ function ComicMeta:showFileSelector(folder, recursive)
         width = Screen:getWidth(),
         height = Screen:getHeight(),
         single_line = true,
-        -- Add a button in the title bar
+        show_path = false,
+        -- Validation button
         title_bar_left_icon = "check",
         onLeftButtonTap = function()
             UIManager:close(file_menu)
 
-            -- Extract only the paths of selected files
+            -- Extract only the selected files from comic_files
             local selected_files = {}
             for _, file_item in ipairs(file_items) do
                 if file_item.selected then
-                    table.insert(selected_files, file_item.path)
+                    table.insert(selected_files, comic_files[file_item.index])
                 end
             end
 
@@ -493,11 +600,100 @@ function ComicMeta:showFileSelector(folder, recursive)
                 return
             end
 
-            -- Call processFiles with the list of paths
+            -- Call processFiles with the subset of comic_files
             self:processFiles(selected_files)
         end,
         onMenuSelect = function(menu, item)
-            -- Toggle selection
+            -- If it's the sort button
+            if item.is_sort_button then
+                local ButtonDialog = require("ui/widget/buttondialog")
+                local sort_dialog = ButtonDialog:new{
+                    title = _("Sort by"),
+                    buttons = {
+                        {
+                            {
+                                text = _("Name ↑"),
+                                callback = function()
+                                    current_sort_type = "name"
+                                    current_sort_order = "asc"
+                                    sortFiles(current_sort_type, current_sort_order)
+                                    rebuildMenuItems()
+                                    file_menu:switchItemTable(nil, file_items)
+                                    UIManager:close(sort_dialog)
+                                end,
+                            },
+                            {
+                                text = _("Name ↓"),
+                                callback = function()
+                                    current_sort_type = "name"
+                                    current_sort_order = "desc"
+                                    sortFiles(current_sort_type, current_sort_order)
+                                    rebuildMenuItems()
+                                    file_menu:switchItemTable(nil, file_items)
+                                    UIManager:close(sort_dialog)
+                                end,
+                            },
+                        },
+                        {
+                            {
+                                text = _("Date ↑"),
+                                callback = function()
+                                    current_sort_type = "date"
+                                    current_sort_order = "asc"
+                                    sortFiles(current_sort_type, current_sort_order)
+                                    rebuildMenuItems()
+                                    file_menu:switchItemTable(nil, file_items)
+                                    UIManager:close(sort_dialog)
+                                end,
+                            },
+                            {
+                                text = _("Date ↓"),
+                                callback = function()
+                                    current_sort_type = "date"
+                                    current_sort_order = "desc"
+                                    sortFiles(current_sort_type, current_sort_order)
+                                    rebuildMenuItems()
+                                    file_menu:switchItemTable(nil, file_items)
+                                    UIManager:close(sort_dialog)
+                                end,
+                            },
+                        },
+                        {
+                            {
+                                text = _("Size ↑"),
+                                callback = function()
+                                    current_sort_type = "size"
+                                    current_sort_order = "asc"
+                                    sortFiles(current_sort_type, current_sort_order)
+                                    rebuildMenuItems()
+                                    file_menu:switchItemTable(nil, file_items)
+                                    UIManager:close(sort_dialog)
+                                end,
+                            },
+                            {
+                                text = _("Size ↓"),
+                                callback = function()
+                                    current_sort_type = "size"
+                                    current_sort_order = "desc"
+                                    sortFiles(current_sort_type, current_sort_order)
+                                    rebuildMenuItems()
+                                    file_menu:switchItemTable(nil, file_items)
+                                    UIManager:close(sort_dialog)
+                                end,
+                            },
+                        },
+                    },
+                }
+                UIManager:show(sort_dialog)
+                return
+            end
+
+            -- If it's a separator, do nothing
+            if item.is_separator then
+                return
+            end
+
+            -- Toggle selection for regular files
             item.selected = not item.selected
             -- Update the text to show selection status
             local base_text = item.path
@@ -518,5 +714,4 @@ function ComicMeta:showFileSelector(folder, recursive)
 
     UIManager:show(file_menu)
 end
-
 return ComicMeta
