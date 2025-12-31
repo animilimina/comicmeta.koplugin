@@ -3,10 +3,16 @@ Plugin for KOReader to extract metadata from comic (.cbz and .cbr) files as Cust
 
 @module koplugin.ComicMeta
 --]]
---
-package.path = package.path .. ";plugins/comicmeta.koplugin/lib/comiclib/?.lua"
-package.path = package.path .. ";plugins/comicmeta.koplugin/lib/comiclib/lib/?.lua"
-package.path = package.path .. ";plugins/comicmeta.koplugin/lib/comiclib/third_party/?/?.lua"
+
+local function getPluginPath()
+    local path = debug.getinfo(1, "S").source:sub(2)  -- Enlève le '@' au début
+    return path:match("(.*/)")  -- Récupère juste le dossier
+end
+
+local plugin_path = getPluginPath()
+package.path = package.path .. ";" .. plugin_path .. "lib/comiclib/?.lua"
+package.path = package.path .. ";" .. plugin_path .. "lib/comiclib/lib/?.lua"
+package.path = package.path .. ";" .. plugin_path .. "lib/comiclib/third_party/?/?.lua"
 
 local ComicLib = require("comiclib")
 local Dispatcher = require("dispatcher") -- luacheck:ignore
@@ -25,6 +31,8 @@ local logger = require("logger")
 local util = require("util")
 local T = ffiUtil.template
 local _ = require("gettext")
+
+-- ... reste du code inchangé
 
 local ComicMeta = WidgetContainer:extend({
     name = "comicmeta",
